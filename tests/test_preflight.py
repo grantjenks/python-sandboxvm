@@ -1,0 +1,59 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+import sandboxvm.preflight as preflight
+from sandboxvm.runtime_paths import (
+    base_image_path,
+    default_persistent_disk_path,
+    disks_dir,
+    images_dir,
+    runtime_metadata_path,
+)
+
+
+def test_check_runtime_reports_missing_assets(monkeypatch, tmp_path: Path) -> None:
+    app_dir = tmp_path / "runtime"
+    monkeypatch.setattr(preflight, "find_qemu_system_binary", lambda: None)
+    monkeypatch.setattr(preflight.shutil, "which", lambda name: None)
+
+    result = preflight.check_runtime(app_dir)
+
+    assert not result.ok
+    assert "qemu-img" in result.missing_executables
+    assert images_dir(app_dir) in result.missing_paths
+    assert base_image_path(app_dir) in result.missing_paths
+    assert default_persistent_disk_path(app_dir) in result.missing_paths
+
+
+def test_check_runtime_ok_when_assets_exist(monkeypatch, tmp_path: Path) -> None:
+    app_dir = tmp_path / "runtime"
+    images_dir(app_dir).mkdir(parents=True)
+    disks_dir(app_dir).mkdir(parents=True)
+    base_image_path(app_dir).touch()
+    default_persistent_disk_path(app_dir).touch()
+    runtime_metadata_path(app_dir).write_text("{}\n", encoding="utf-8")
+
+    monkeypatch.setattr(preflight, "find_qemu_system_binary", lambda: "/usr/bin/qemu-system-x86_64")
+    monkeypatch.setattr(preflight.shutil, "which", lambda name: "/usr/bin/qemu-img")
+
+    result = preflight.check_runtime(app_dir)
+
+    assert result.ok
+    assert not result.missing_paths
+    assert not result.missing_executables
+
+
+def test_assert_runtime_ready_points_to_setup(monkeypatch, tmp_path: Path) -> None:
+    app_dir = tmp_path / "runtime"
+    monkeypatch.setattr(preflight, "find_qemu_system_binary", lambda: None)
+    monkeypatch.setattr(preflight.shutil, "which", lambda name: None)
+
+    try:
+        preflight.assert_runtime_ready(app_dir)
+    except RuntimeError as exc:
+        message = str(exc)
+    else:
+        raise AssertionError("expected RuntimeError")
+
+    assert "python -m sandboxvm.setup" in message
