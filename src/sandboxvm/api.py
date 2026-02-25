@@ -10,6 +10,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tarfile
@@ -40,6 +41,7 @@ _DEFAULT_COMMAND_TIMEOUT_S = 60.0
 _TRANSFER_TIMEOUT_S = 120.0
 _QEMU_HELP_TIMEOUT_S = 5.0
 _SHUTDOWN_TIMEOUT_S = 10.0
+_CONTROL_CONNECT_TIMEOUT_S = 15.0
 
 _REQ_PREFIX = "__SANDBOXVM_REQ__"
 _RESP_PREFIX = "__SANDBOXVM_RESP__"
@@ -60,7 +62,11 @@ class _LaunchPlan:
 @dataclass
 class _GuestState:
     process: subprocess.Popen[str]
+    control_socket: socket.socket
+    control_reader: io.TextIOBase
+    control_writer: io.TextIOBase
     reader_thread: threading.Thread
+    qemu_log_thread: threading.Thread
     messages: queue.Queue[tuple[str, dict[str, object] | None]]
     recent_logs: collections.deque[str]
     launch: _LaunchPlan
@@ -524,13 +530,15 @@ class Sandbox:
         return result
 
     def _spawn_guest_process(self, *, qemu_system_binary: str, launch: _LaunchPlan) -> _GuestState:
+        serial_port = _allocate_loopback_port()
         args = self._build_qemu_args(
             qemu_system_binary=qemu_system_binary,
             launch=launch,
+            serial_endpoint=f"tcp:127.0.0.1:{serial_port},server=on,wait=on",
         )
         process = subprocess.Popen(
             args,
-            stdin=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -540,45 +548,109 @@ class Sandbox:
         messages: queue.Queue[tuple[str, dict[str, object] | None]] = queue.Queue()
         recent_logs: collections.deque[str] = collections.deque(maxlen=200)
 
+        qemu_log_thread = threading.Thread(
+            target=self._qemu_log_loop,
+            args=(process, recent_logs),
+            daemon=True,
+        )
+        qemu_log_thread.start()
+
+        control_socket = self._connect_control_socket(
+            port=serial_port,
+            process=process,
+            recent_logs=recent_logs,
+        )
+        control_reader = control_socket.makefile(
+            "r",
+            encoding="utf-8",
+            newline="\n",
+            errors="replace",
+        )
+        control_writer = control_socket.makefile(
+            "w",
+            encoding="utf-8",
+            newline="\n",
+        )
+
         thread = threading.Thread(
             target=self._reader_loop,
-            args=(process, messages, recent_logs),
+            args=(control_reader, messages, recent_logs),
             daemon=True,
         )
         thread.start()
 
         return _GuestState(
             process=process,
+            control_socket=control_socket,
+            control_reader=control_reader,
+            control_writer=control_writer,
             reader_thread=thread,
+            qemu_log_thread=qemu_log_thread,
             messages=messages,
             recent_logs=recent_logs,
             launch=launch,
         )
 
     @staticmethod
-    def _reader_loop(
+    def _qemu_log_loop(
         process: subprocess.Popen[str],
-        messages: queue.Queue[tuple[str, dict[str, object] | None]],
         recent_logs: collections.deque[str],
     ) -> None:
-        assert process.stdout is not None
-
+        if process.stdout is None:
+            return
         for raw_line in process.stdout:
             line = _sanitize_serial_line(raw_line)
-            parsed_any = False
-            for payload in _extract_framed_payloads(line, prefix=_READY_PREFIX):
-                messages.put(("ready", payload))
-                parsed_any = True
-            for payload in _extract_framed_payloads(line, prefix=_RESP_PREFIX):
-                messages.put(("response", payload))
-                parsed_any = True
-
-            if parsed_any:
-                continue
             if line:
                 recent_logs.append(line)
 
-        messages.put(("eof", None))
+    @staticmethod
+    def _connect_control_socket(
+        *,
+        port: int,
+        process: subprocess.Popen[str],
+        recent_logs: collections.deque[str],
+    ) -> socket.socket:
+        deadline = time.monotonic() + _CONTROL_CONNECT_TIMEOUT_S
+        while True:
+            if process.poll() is not None:
+                raise RuntimeError(
+                    "VM exited before control channel was ready.\n"
+                    + ("\n".join(recent_logs) if recent_logs else "(no guest logs captured)")
+                )
+            try:
+                connection = socket.create_connection(("127.0.0.1", port), timeout=0.5)
+                connection.settimeout(None)
+                return connection
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("Timed out connecting to VM control channel.")
+                time.sleep(0.05)
+
+    @staticmethod
+    def _reader_loop(
+        control_reader: io.TextIOBase,
+        messages: queue.Queue[tuple[str, dict[str, object] | None]],
+        recent_logs: collections.deque[str],
+    ) -> None:
+        try:
+            for raw_line in control_reader:
+                line = _sanitize_serial_line(raw_line)
+                parsed_any = False
+                for payload in _extract_framed_payloads(line, prefix=_READY_PREFIX):
+                    messages.put(("ready", payload))
+                    parsed_any = True
+                for payload in _extract_framed_payloads(line, prefix=_RESP_PREFIX):
+                    messages.put(("response", payload))
+                    parsed_any = True
+
+                if parsed_any:
+                    continue
+                if line:
+                    recent_logs.append(line)
+        except Exception as exc:
+            recent_logs.append(f"(control channel read error: {exc})")
+        finally:
+            messages.put(("eof", None))
 
     def _wait_for_ready(self, state: _GuestState, *, timeout_s: float) -> None:
         deadline = time.monotonic() + timeout_s
@@ -601,7 +673,7 @@ class Sandbox:
                 return
             if kind == "eof":
                 raise RuntimeError(
-                    "VM stdout closed before readiness signal.\n"
+                    "VM control channel closed before readiness signal.\n"
                     + self._format_recent_logs(state)
                 )
             if kind == "response":
@@ -642,17 +714,15 @@ class Sandbox:
 
             if kind == "eof":
                 raise RuntimeError(
-                    "VM stdout closed while waiting for response.\n"
+                    "VM control channel closed while waiting for response.\n"
                     + self._format_recent_logs(state)
                 )
 
     def _send_payload(self, state: _GuestState, payload: dict[str, object]) -> None:
-        if state.process.stdin is None:
-            raise RuntimeError("VM stdin is unavailable.")
         line = _REQ_PREFIX + _encode_json_payload(payload) + "\n"
         try:
-            state.process.stdin.write(line)
-            state.process.stdin.flush()
+            state.control_writer.write(line)
+            state.control_writer.flush()
         except Exception as exc:
             raise RuntimeError(f"Failed to send guest request: {exc}") from exc
 
@@ -696,19 +766,32 @@ class Sandbox:
                         process.kill()
                         process.wait(timeout=2.0)
 
+        try:
+            state.control_writer.close()
+        except Exception:
+            pass
+        try:
+            state.control_reader.close()
+        except Exception:
+            pass
+        try:
+            state.control_socket.close()
+        except Exception:
+            pass
         if process.stdout is not None:
             process.stdout.close()
-        if process.stdin is not None:
-            process.stdin.close()
 
         if state.reader_thread.is_alive():
             state.reader_thread.join(timeout=1.0)
+        if state.qemu_log_thread.is_alive():
+            state.qemu_log_thread.join(timeout=1.0)
 
     def _build_qemu_args(
         self,
         *,
         qemu_system_binary: str,
         launch: _LaunchPlan,
+        serial_endpoint: str = "stdio",
     ) -> list[str]:
         append = [
             "console=ttyS0",
@@ -731,7 +814,7 @@ class Sandbox:
             "-monitor",
             "none",
             "-serial",
-            "stdio",
+            serial_endpoint,
             "-no-reboot",
             "-kernel",
             str(kernel_image_path(self.app_dir)),
@@ -824,6 +907,13 @@ def _validate_env(env: dict[str, str]) -> dict[str, str]:
 
 def _command_wait_timeout(timeout_s: float | None) -> float:
     return _POST_COMMAND_GRACE_S + (timeout_s if timeout_s is not None else _DEFAULT_COMMAND_TIMEOUT_S)
+
+
+def _allocate_loopback_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        return int(listener.getsockname()[1])
 
 
 def _encode_json_payload(payload: dict[str, object]) -> str:
