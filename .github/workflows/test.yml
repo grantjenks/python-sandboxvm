@@ -29,4 +29,56 @@ jobs:
           uv sync --extra dev
 
       - name: Run unit tests
-        run: uv run python -m pytest -q
+        run: uv run python -m pytest -q -m "not integration"
+
+  vm-tests:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python-version: ["3.12"]
+
+    env:
+      SANDBOXVM_HOME: ${{ github.workspace }}/.sandboxvm
+      SANDBOXVM_RUN_VM_TESTS: "1"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Install project and test dependencies
+        run: uv sync --extra dev
+
+      - name: Install QEMU (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 qemu-utils
+
+      - name: Install QEMU (macOS)
+        if: runner.os == 'macOS'
+        run: HOMEBREW_NO_AUTO_UPDATE=1 brew install qemu
+
+      - name: Install QEMU (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install qemu --yes --no-progress
+          $qemuPath = "$env:ProgramFiles\qemu"
+          if (Test-Path $qemuPath) {
+            $qemuPath | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          }
+
+      - name: Initialize sandboxvm runtime
+        run: uv run python -m sandboxvm.setup --yes --force
+
+      - name: Run VM integration tests
+        run: uv run python -m pytest -q -m integration

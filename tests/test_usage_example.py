@@ -1,11 +1,19 @@
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import textwrap
 
+import pytest
+
+pytestmark = pytest.mark.integration
+
 
 def test_user_snippet_runs_verbatim() -> None:
+    if os.environ.get("SANDBOXVM_RUN_VM_TESTS") != "1":
+        pytest.skip("integration test disabled; set SANDBOXVM_RUN_VM_TESTS=1")
+
     snippet = textwrap.dedent(
         """
         from sandboxvm import Sandbox, SandboxConfig, NetworkConfig
