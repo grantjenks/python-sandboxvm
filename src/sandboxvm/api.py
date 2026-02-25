@@ -262,10 +262,14 @@ class Sandbox:
 
         errors: list[str] = []
         for index, launch in enumerate(launch_plans):
-            state = self._spawn_guest_process(
-                qemu_system_binary=qemu_system_binary,
-                launch=launch,
-            )
+            try:
+                state = self._spawn_guest_process(
+                    qemu_system_binary=qemu_system_binary,
+                    launch=launch,
+                )
+            except Exception as exc:
+                errors.append(f"{launch.label}: {exc}")
+                continue
             attempt_timeout = _boot_timeout_for_attempt(
                 attempt=index,
                 total_attempts=len(launch_plans),
