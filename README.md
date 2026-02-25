@@ -207,6 +207,11 @@ Startup behavior:
 - `sandboxvm` assumes these assets exist in the app directory.
 - if assets are missing, preflight errors should instruct the user to rerun `python -m sandboxvm.setup`.
 
+Launch behavior:
+
+- Linux launch prefers `microvm` and will use `kvm` automatically when available, falling back to `tcg`.
+- macOS/Windows default to `tcg` for reliability; set `SANDBOXVM_USE_HOST_ACCEL=1` to opt in to `hvf`/`whpx` probing.
+
 ---
 
 ## PyPI Distribution Policy

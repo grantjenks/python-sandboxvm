@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import base64
+import functools
+import os
 import re
 import subprocess
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -30,6 +33,98 @@ _TIMED_OUT_PREFIX = "__SANDBOXVM_TIMED_OUT__"
 
 _BOOT_TIMEOUT_S = 120.0
 _POST_COMMAND_GRACE_S = 10.0
+_QEMU_HELP_TIMEOUT_S = 5.0
+
+
+@dataclass(frozen=True)
+class _LaunchPlan:
+    machine: str
+    accel: str
+
+    @property
+    def label(self) -> str:
+        return f"{self.machine}/{self.accel}"
+
+
+def _preferred_accelerators_for_platform(platform: str) -> tuple[str, ...]:
+    if platform.startswith("linux"):
+        return ("kvm", "tcg")
+    host_accel_opt_in = os.environ.get("SANDBOXVM_USE_HOST_ACCEL") == "1"
+    if platform == "darwin":
+        return ("hvf", "tcg") if host_accel_opt_in else ("tcg", "hvf")
+    if platform in {"win32", "cygwin"}:
+        return ("whpx", "tcg") if host_accel_opt_in else ("tcg", "whpx")
+    return ("tcg",)
+
+
+def _pick_accelerator(*, platform: str, available: set[str]) -> str:
+    for candidate in _preferred_accelerators_for_platform(platform):
+        if candidate in available:
+            return candidate
+    if "tcg" in available:
+        return "tcg"
+    return "tcg"
+
+
+def _build_launch_plans(
+    *,
+    platform: str,
+    available_accelerators: set[str],
+    supports_microvm: bool,
+) -> list[_LaunchPlan]:
+    preferred = _pick_accelerator(platform=platform, available=available_accelerators)
+    plans: list[_LaunchPlan] = []
+    # microvm is the primary perf path on Linux (kvm/tcg).
+    if supports_microvm and platform.startswith("linux") and preferred in {"kvm", "tcg"}:
+        plans.append(_LaunchPlan(machine="microvm", accel=preferred))
+
+    plans.append(_LaunchPlan(machine="pc", accel=preferred))
+
+    if preferred != "tcg":
+        if supports_microvm and platform.startswith("linux"):
+            plans.append(_LaunchPlan(machine="microvm", accel="tcg"))
+        plans.append(_LaunchPlan(machine="pc", accel="tcg"))
+
+    deduped: list[_LaunchPlan] = []
+    seen: set[tuple[str, str]] = set()
+    for plan in plans:
+        key = (plan.machine, plan.accel)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(plan)
+    return deduped
+
+
+@functools.lru_cache(maxsize=8)
+def _qemu_help_text(qemu_system_binary: str, topic: str) -> str:
+    try:
+        completed = subprocess.run(
+            [qemu_system_binary, topic, "help"],
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=_QEMU_HELP_TIMEOUT_S,
+        )
+    except Exception:
+        return ""
+    return f"{completed.stdout}\n{completed.stderr}"
+
+
+@functools.lru_cache(maxsize=8)
+def _available_accelerators(qemu_system_binary: str) -> tuple[str, ...]:
+    text = _qemu_help_text(qemu_system_binary, "-accel").lower()
+    known = ("kvm", "hvf", "whpx", "hax", "tcg")
+    available = [name for name in known if re.search(rf"\b{name}\b", text)]
+    if not available:
+        return ("tcg",)
+    return tuple(available)
+
+
+@functools.lru_cache(maxsize=8)
+def _supports_microvm_machine(qemu_system_binary: str) -> bool:
+    text = _qemu_help_text(qemu_system_binary, "-machine").lower()
+    return bool(re.search(r"^\s*microvm(?:\s|$)", text, flags=re.MULTILINE))
 
 
 @dataclass
@@ -110,47 +205,74 @@ class Sandbox:
         if runtime.qemu_system_binary is None:
             assert_runtime_ready(self.app_dir)
 
-        qemu_args = self._build_qemu_args(
-            qemu_system_binary=runtime.qemu_system_binary,
-            command=command,
-            timeout_s=timeout_s,
+        qemu_system_binary = runtime.qemu_system_binary
+        launch_plans = _build_launch_plans(
+            platform=sys.platform,
+            available_accelerators=set(_available_accelerators(qemu_system_binary)),
+            supports_microvm=_supports_microvm_machine(qemu_system_binary),
         )
         host_timeout_s = _BOOT_TIMEOUT_S + _POST_COMMAND_GRACE_S
         if timeout_s is not None:
             host_timeout_s += timeout_s
 
-        try:
-            completed = subprocess.run(
-                qemu_args,
-                capture_output=True,
-                check=False,
-                text=True,
-                timeout=host_timeout_s,
-            )
-        except subprocess.TimeoutExpired as exc:
-            return RunResult(
-                exit_code=124,
-                stdout="",
-                stderr=(
-                    "VM execution timed out before producing a result.\n"
-                    f"{_coerce_text(exc.stdout)}\n{_coerce_text(exc.stderr)}"
-                ),
-                timed_out=True,
+        attempts: list[str] = []
+        for index, launch in enumerate(launch_plans):
+            qemu_args = self._build_qemu_args(
+                qemu_system_binary=qemu_system_binary,
+                command=command,
+                timeout_s=timeout_s,
+                launch=launch,
             )
 
-        parsed = _parse_run_result(f"{completed.stdout}\n{completed.stderr}")
-        if parsed is None:
-            return RunResult(
-                exit_code=125,
-                stdout="",
-                stderr=(
-                    "VM did not return structured execution markers.\n"
-                    "This usually indicates a boot or guest init failure.\n"
-                    f"qemu return code: {completed.returncode}\n"
-                    f"{completed.stdout}\n{completed.stderr}"
-                ),
+            try:
+                completed = subprocess.run(
+                    qemu_args,
+                    capture_output=True,
+                    check=False,
+                    text=True,
+                    timeout=host_timeout_s,
+                )
+            except subprocess.TimeoutExpired as exc:
+                return RunResult(
+                    exit_code=124,
+                    stdout="",
+                    stderr=(
+                        "VM execution timed out before producing a result.\n"
+                        f"launch attempt: {launch.label}\n"
+                        f"{_coerce_text(exc.stdout)}\n{_coerce_text(exc.stderr)}"
+                    ),
+                    timed_out=True,
+                )
+
+            raw_output = f"{completed.stdout}\n{completed.stderr}"
+            parsed = _parse_run_result(raw_output)
+            if parsed is not None:
+                return parsed
+
+            attempts.append(
+                "\n".join(
+                    [
+                        f"launch attempt: {launch.label}",
+                        f"qemu return code: {completed.returncode}",
+                        completed.stdout,
+                        completed.stderr,
+                    ]
+                )
             )
-        return parsed
+
+            can_retry = index < len(launch_plans) - 1 and completed.returncode != 0
+            if not can_retry:
+                break
+
+        return RunResult(
+            exit_code=125,
+            stdout="",
+            stderr=(
+                "VM did not return structured execution markers.\n"
+                "This usually indicates a boot or guest init failure.\n\n"
+                + "\n\n".join(attempts)
+            ),
+        )
 
     def _build_qemu_args(
         self,
@@ -158,6 +280,7 @@ class Sandbox:
         qemu_system_binary: str,
         command: str,
         timeout_s: float | None,
+        launch: _LaunchPlan,
     ) -> list[str]:
         cmd_b64 = base64.urlsafe_b64encode(command.encode("utf-8")).decode("ascii")
         append = [
@@ -169,10 +292,10 @@ class Sandbox:
         if timeout_s is not None:
             append.append(f"sandbox_timeout={timeout_s:.6f}")
 
-        args = [
+        common = [
             qemu_system_binary,
             "-machine",
-            "pc,accel=tcg",
+            f"{launch.machine},accel={launch.accel}",
             "-cpu",
             "max",
             "-smp",
@@ -192,6 +315,28 @@ class Sandbox:
             str(initramfs_image_path(self.app_dir)),
             "-append",
             " ".join(append),
+        ]
+        if launch.machine == "microvm":
+            args = [
+                *common,
+                "-nodefaults",
+                "-no-user-config",
+                "-drive",
+                (
+                    "id=persistent,if=none,format=qcow2,file="
+                    f"{default_persistent_disk_path(self.app_dir)}"
+                ),
+                "-device",
+                "virtio-blk-device,drive=persistent",
+                "-device",
+                "virtio-rng-device",
+            ]
+            if self.config.network.enabled:
+                args.extend(["-netdev", "user,id=net0", "-device", "virtio-net-device,netdev=net0"])
+            return args
+
+        args = [
+            *common,
             "-drive",
             f"if=virtio,format=qcow2,file={default_persistent_disk_path(self.app_dir)}",
             "-device",
