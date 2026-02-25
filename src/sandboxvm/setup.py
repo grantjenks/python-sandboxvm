@@ -709,6 +709,19 @@ def _emit_response(request_id: str, *, ok: bool, result: dict | None = None, err
     _emit(RESP_PREFIX, payload)
 
 
+def _configure_serial_stdin() -> None:
+    try:
+        import termios
+
+        fd = sys.stdin.fileno()
+        attrs = termios.tcgetattr(fd)
+        attrs[3] &= ~getattr(termios, "ECHO", 0)
+        attrs[3] &= ~getattr(termios, "ECHONL", 0)
+        termios.tcsetattr(fd, termios.TCSANOW, attrs)
+    except Exception:
+        pass
+
+
 def _safe_guest_path(value: object) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError("path must be a non-empty string")
@@ -952,6 +965,7 @@ def _power_off() -> None:
 
 def main() -> int:
     _mount_virtual_filesystems()
+    _configure_serial_stdin()
     os.makedirs("/workspace", exist_ok=True)
     _emit(READY_PREFIX, {"protocol": 1})
 

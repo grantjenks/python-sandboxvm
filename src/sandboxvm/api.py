@@ -44,6 +44,7 @@ _SHUTDOWN_TIMEOUT_S = 10.0
 _REQ_PREFIX = "__SANDBOXVM_REQ__"
 _RESP_PREFIX = "__SANDBOXVM_RESP__"
 _READY_PREFIX = "__SANDBOXVM_READY__"
+_FRAME_PREFIXES = (_READY_PREFIX, _RESP_PREFIX, _REQ_PREFIX)
 
 
 @dataclass(frozen=True)
@@ -563,18 +564,19 @@ class Sandbox:
         assert process.stdout is not None
 
         for raw_line in process.stdout:
-            line = raw_line.rstrip("\r\n")
-            if line.startswith(_READY_PREFIX):
-                payload = _decode_json_payload(line[len(_READY_PREFIX) :])
-                if payload is not None:
-                    messages.put(("ready", payload))
+            line = _sanitize_serial_line(raw_line)
+            parsed_any = False
+            for payload in _extract_framed_payloads(line, prefix=_READY_PREFIX):
+                messages.put(("ready", payload))
+                parsed_any = True
+            for payload in _extract_framed_payloads(line, prefix=_RESP_PREFIX):
+                messages.put(("response", payload))
+                parsed_any = True
+
+            if parsed_any:
                 continue
-            if line.startswith(_RESP_PREFIX):
-                payload = _decode_json_payload(line[len(_RESP_PREFIX) :])
-                if payload is not None:
-                    messages.put(("response", payload))
-                continue
-            recent_logs.append(line)
+            if line:
+                recent_logs.append(line)
 
         messages.put(("eof", None))
 
@@ -838,6 +840,38 @@ def _decode_json_payload(value: str) -> dict[str, object] | None:
     if not isinstance(parsed, dict):
         return None
     return parsed
+
+
+def _sanitize_serial_line(raw_line: str) -> str:
+    stripped = raw_line.strip("\r\n")
+    if not stripped:
+        return ""
+    cleaned = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", stripped)
+    return "".join(ch for ch in cleaned if " " <= ch <= "~")
+
+
+def _extract_framed_payloads(line: str, *, prefix: str) -> list[dict[str, object]]:
+    payloads: list[dict[str, object]] = []
+    if not line:
+        return payloads
+
+    start = 0
+    while True:
+        index = line.find(prefix, start)
+        if index < 0:
+            break
+        payload_start = index + len(prefix)
+        next_prefixes = [
+            pos
+            for marker in _FRAME_PREFIXES
+            if (pos := line.find(marker, payload_start)) >= 0
+        ]
+        payload_end = min(next_prefixes) if next_prefixes else len(line)
+        payload = _decode_json_payload(line[payload_start:payload_end].strip())
+        if payload is not None:
+            payloads.append(payload)
+        start = payload_start
+    return payloads
 
 
 def _decode_b64(value: object) -> str:
