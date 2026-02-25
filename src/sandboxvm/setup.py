@@ -633,17 +633,19 @@ def _guest_init_program() -> str:
     return """#!/usr/bin/python3
 import base64
 import ctypes
+import io
+import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
+import tarfile
+import time
 
-STDOUT_BEGIN = "__SANDBOXVM_STDOUT_BEGIN__"
-STDOUT_END = "__SANDBOXVM_STDOUT_END__"
-STDERR_BEGIN = "__SANDBOXVM_STDERR_BEGIN__"
-STDERR_END = "__SANDBOXVM_STDERR_END__"
-EXIT_CODE_PREFIX = "__SANDBOXVM_EXIT_CODE__"
-TIMED_OUT_PREFIX = "__SANDBOXVM_TIMED_OUT__"
+REQ_PREFIX = "__SANDBOXVM_REQ__"
+RESP_PREFIX = "__SANDBOXVM_RESP__"
+READY_PREFIX = "__SANDBOXVM_READY__"
 
 
 def _mount_virtual_filesystems() -> None:
@@ -678,38 +680,257 @@ def _mount_virtual_filesystems() -> None:
             pass
 
 
-def _parse_cmdline() -> dict[str, str]:
-    out: dict[str, str] = {}
-    try:
-        text = open("/proc/cmdline", "r", encoding="utf-8").read().strip()
-    except OSError:
-        return out
-    for token in text.split():
-        if "=" in token:
-            key, value = token.split("=", 1)
-            out[key] = value
+def _encode_payload(payload: dict) -> str:
+    raw = json.dumps(payload, separators=(",", ":"), sort_keys=False).encode("utf-8")
+    return base64.b64encode(raw).decode("ascii")
+
+
+def _decode_payload(value: str) -> dict:
+    raw = base64.b64decode(value.encode("ascii"), validate=True)
+    payload = json.loads(raw.decode("utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("payload must decode to a JSON object")
+    return payload
+
+
+def _emit(prefix: str, payload: dict) -> None:
+    print(prefix + _encode_payload(payload), flush=True)
+
+
+def _emit_response(request_id: str, *, ok: bool, result: dict | None = None, error: str | None = None) -> None:
+    payload: dict = {
+        "id": request_id,
+        "ok": ok,
+    }
+    if ok:
+        payload["result"] = result or {}
+    else:
+        payload["error"] = error or "unknown guest error"
+    _emit(RESP_PREFIX, payload)
+
+
+def _safe_guest_path(value: object) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("path must be a non-empty string")
+    normalized = os.path.normpath(value)
+    if not normalized.startswith("/"):
+        normalized = os.path.normpath(os.path.join("/workspace", normalized))
+    return normalized
+
+
+def _decode_data_field(value: object) -> bytes:
+    if not isinstance(value, str):
+        return b""
+    return base64.b64decode(value.encode("ascii"), validate=True)
+
+
+def _encode_data_field(data: bytes) -> str:
+    return base64.b64encode(data).decode("ascii")
+
+
+def _count_files(path: str) -> int:
+    total = 0
+    for _, _, files in os.walk(path):
+        total += len(files)
+    return total
+
+
+def _handle_run(req: dict) -> dict:
+    command = req.get("command")
+    if isinstance(command, str):
+        stripped = command.strip()
+        if not stripped:
+            raise ValueError("`command` must be a non-empty string")
+        if os.path.exists("/bin/sh"):
+            run_target = stripped
+            shell = True
         else:
-            out[token] = ""
-    return out
+            run_target = shlex.split(stripped)
+            if not run_target:
+                raise ValueError("`command` must be a non-empty string")
+            shell = False
+    elif isinstance(command, list) and command and all(isinstance(item, str) for item in command):
+        run_target = command
+        shell = False
+    else:
+        raise ValueError("`command` must be a non-empty string or list of strings")
+
+    timeout_value = req.get("timeout_s")
+    timeout = None if timeout_value is None else float(timeout_value)
+
+    cwd = req.get("cwd")
+    resolved_cwd = None if cwd is None else _safe_guest_path(cwd)
+
+    env_map = os.environ.copy()
+    custom_env = req.get("env")
+    if custom_env is not None:
+        if not isinstance(custom_env, dict):
+            raise ValueError("`env` must be a JSON object")
+        for key, value in custom_env.items():
+            if not isinstance(key, str) or not isinstance(value, str):
+                raise ValueError("`env` entries must be string->string")
+            env_map[key] = value
+
+    stdin_data = _decode_data_field(req.get("stdin_b64"))
+
+    kwargs = {
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "input": stdin_data,
+        "timeout": timeout,
+        "check": False,
+        "cwd": resolved_cwd,
+        "env": env_map,
+    }
+    if shell:
+        kwargs["shell"] = True
+        kwargs["executable"] = "/bin/sh"
+    else:
+        kwargs["shell"] = False
+
+    started = time.monotonic()
+    try:
+        completed = subprocess.run(run_target, **kwargs)
+        exit_code = int(completed.returncode)
+        stdout_data = completed.stdout or b""
+        stderr_data = completed.stderr or b""
+        timed_out = False
+    except subprocess.TimeoutExpired as exc:
+        exit_code = 124
+        stdout_data = exc.stdout or b""
+        stderr_data = exc.stderr or b""
+        timed_out = True
+
+    duration_s = time.monotonic() - started
+    return {
+        "exit_code": exit_code,
+        "stdout_b64": _encode_data_field(stdout_data),
+        "stderr_b64": _encode_data_field(stderr_data),
+        "timed_out": timed_out,
+        "duration_s": duration_s,
+    }
 
 
-def _decode_command(value: str) -> str:
-    if not value:
-        return ""
-    padding = "=" * ((4 - len(value) % 4) % 4)
-    raw = base64.urlsafe_b64decode((value + padding).encode("ascii"))
-    return raw.decode("utf-8")
+def _handle_write_file(req: dict) -> dict:
+    path = _safe_guest_path(req.get("path"))
+    data = _decode_data_field(req.get("data_b64"))
+    overwrite = bool(req.get("overwrite", True))
+    mode = int(req.get("mode", 0o644))
+
+    if os.path.exists(path) and not overwrite:
+        raise FileExistsError(path)
+
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+    started = time.monotonic()
+    with open(path, "wb") as handle:
+        handle.write(data)
+    try:
+        os.chmod(path, mode)
+    except OSError:
+        pass
+    duration_s = time.monotonic() - started
+    return {
+        "bytes_transferred": len(data),
+        "files_transferred": 1,
+        "duration_s": duration_s,
+    }
 
 
-def _emit(exit_code: int, stdout_data: bytes, stderr_data: bytes, timed_out: bool) -> None:
-    print(STDOUT_BEGIN, flush=True)
-    print(base64.b64encode(stdout_data).decode("ascii"), flush=True)
-    print(STDOUT_END, flush=True)
-    print(STDERR_BEGIN, flush=True)
-    print(base64.b64encode(stderr_data).decode("ascii"), flush=True)
-    print(STDERR_END, flush=True)
-    print(f"{EXIT_CODE_PREFIX}{exit_code}", flush=True)
-    print(f"{TIMED_OUT_PREFIX}{1 if timed_out else 0}", flush=True)
+def _handle_read_file(req: dict) -> dict:
+    path = _safe_guest_path(req.get("path"))
+    max_bytes_value = req.get("max_bytes")
+    max_bytes = None if max_bytes_value is None else int(max_bytes_value)
+
+    started = time.monotonic()
+    with open(path, "rb") as handle:
+        data = handle.read()
+    if max_bytes is not None and len(data) > max_bytes:
+        raise ValueError(f"file exceeds max_bytes ({len(data)} > {max_bytes})")
+    mode = 0o644
+    try:
+        mode = int(os.stat(path).st_mode & 0o777)
+    except OSError:
+        pass
+    duration_s = time.monotonic() - started
+    return {
+        "data_b64": _encode_data_field(data),
+        "mode": mode,
+        "bytes_transferred": len(data),
+        "files_transferred": 1,
+        "duration_s": duration_s,
+    }
+
+
+def _safe_extract_tar(data: bytes, destination: str) -> int:
+    with tarfile.open(fileobj=io.BytesIO(data), mode="r:*") as archive:
+        members = archive.getmembers()
+        base = os.path.abspath(destination)
+        for member in members:
+            candidate = os.path.abspath(os.path.join(base, member.name))
+            if candidate != base and not candidate.startswith(base + os.sep):
+                raise ValueError(f"unsafe tar member path: {member.name}")
+        archive.extractall(path=destination)
+    return _count_files(destination)
+
+
+def _handle_extract_tar(req: dict) -> dict:
+    path = _safe_guest_path(req.get("path"))
+    tar_data = _decode_data_field(req.get("tar_b64"))
+    overwrite = bool(req.get("overwrite", True))
+
+    started = time.monotonic()
+    if overwrite and os.path.exists(path):
+        if os.path.isdir(path):
+            shutil.rmtree(path)
+        else:
+            os.unlink(path)
+    os.makedirs(path, exist_ok=True)
+    files = _safe_extract_tar(tar_data, path)
+    duration_s = time.monotonic() - started
+    return {
+        "bytes_transferred": len(tar_data),
+        "files_transferred": files,
+        "duration_s": duration_s,
+    }
+
+
+def _handle_archive_dir(req: dict) -> dict:
+    path = _safe_guest_path(req.get("path"))
+    if not os.path.isdir(path):
+        raise NotADirectoryError(path)
+
+    started = time.monotonic()
+    with io.BytesIO() as buffer:
+        with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
+            archive.add(path, arcname=".")
+        tar_data = buffer.getvalue()
+    duration_s = time.monotonic() - started
+    return {
+        "tar_b64": _encode_data_field(tar_data),
+        "bytes_transferred": len(tar_data),
+        "files_transferred": _count_files(path),
+        "duration_s": duration_s,
+    }
+
+
+def _handle_request(req: dict) -> tuple[dict, bool]:
+    action = req.get("action")
+    if action == "run":
+        return _handle_run(req), False
+    if action == "write_file":
+        return _handle_write_file(req), False
+    if action == "read_file":
+        return _handle_read_file(req), False
+    if action == "extract_tar":
+        return _handle_extract_tar(req), False
+    if action == "archive_dir":
+        return _handle_archive_dir(req), False
+    if action == "shutdown":
+        return {"status": "shutting_down"}, True
+    raise ValueError(f"unsupported action: {action!r}")
 
 
 def _power_off() -> None:
@@ -731,52 +952,27 @@ def _power_off() -> None:
 
 def main() -> int:
     _mount_virtual_filesystems()
-    cmdline = _parse_cmdline()
-    encoded = cmdline.get("sandbox_cmd_b64", "")
-    timeout_raw = cmdline.get("sandbox_timeout", "")
+    os.makedirs("/workspace", exist_ok=True)
+    _emit(READY_PREFIX, {"protocol": 1})
 
-    try:
-        command = _decode_command(encoded)
-    except Exception as exc:
-        _emit(125, b"", f"failed to decode command: {exc}\\n".encode("utf-8"), False)
-        _power_off()
+    for raw_line in sys.stdin:
+        line = raw_line.strip()
+        if not line.startswith(REQ_PREFIX):
+            continue
+        encoded = line[len(REQ_PREFIX) :]
 
-    if not command:
-        _emit(125, b"", b"missing command\\n", False)
-        _power_off()
-
-    timeout = None
-    if timeout_raw:
+        request_id = ""
+        should_shutdown = False
         try:
-            timeout = float(timeout_raw)
-        except ValueError:
-            timeout = None
+            req = _decode_payload(encoded)
+            request_id = str(req.get("id", ""))
+            result, should_shutdown = _handle_request(req)
+            _emit_response(request_id, ok=True, result=result)
+        except Exception as exc:
+            _emit_response(request_id, ok=False, error=str(exc))
 
-    try:
-        argv = shlex.split(command)
-    except ValueError as exc:
-        _emit(125, b"", f"failed to parse command: {exc}\\n".encode("utf-8"), False)
-        _power_off()
-
-    if not argv:
-        _emit(125, b"", b"empty command\\n", False)
-        _power_off()
-
-    try:
-        completed = subprocess.run(
-            argv,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=timeout,
-            check=False,
-        )
-        _emit(completed.returncode, completed.stdout or b"", completed.stderr or b"", False)
-    except FileNotFoundError as exc:
-        _emit(127, b"", f"{exc}\\n".encode("utf-8", errors="replace"), False)
-    except subprocess.TimeoutExpired as exc:
-        _emit(124, exc.stdout or b"", exc.stderr or b"", True)
-    except Exception as exc:
-        _emit(125, b"", f"guest execution error: {exc}\\n".encode("utf-8", errors="replace"), False)
+        if should_shutdown:
+            break
 
     _power_off()
 

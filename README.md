@@ -64,6 +64,18 @@ with Sandbox(cfg) as vm:
     print(result.stderr)
 ```
 
+Session behavior:
+
+- entering `with Sandbox(...)` boots one VM session,
+- repeated `vm.run(...)` calls execute inside that same live guest,
+- exiting the context shuts the guest down.
+
+File transfer helpers:
+
+- `vm.put_bytes(...)`, `vm.get_bytes(...)`
+- `vm.put_file(...)`, `vm.get_file(...)`
+- `vm.put_dir(...)`, `vm.get_dir(...)`
+
 ### Planned API Objects
 
 - `SandboxConfig`
