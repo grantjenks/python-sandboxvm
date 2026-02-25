@@ -5,10 +5,11 @@ from pathlib import Path
 
 import sandboxvm.preflight as preflight
 from sandboxvm.runtime_paths import (
-    base_image_path,
     default_persistent_disk_path,
     disks_dir,
     images_dir,
+    initramfs_image_path,
+    kernel_image_path,
     runtime_metadata_path,
 )
 
@@ -23,7 +24,8 @@ def test_check_runtime_reports_missing_assets(monkeypatch, tmp_path: Path) -> No
     assert not result.ok
     assert "qemu-img" in result.missing_executables
     assert images_dir(app_dir) in result.missing_paths
-    assert base_image_path(app_dir) in result.missing_paths
+    assert kernel_image_path(app_dir) in result.missing_paths
+    assert initramfs_image_path(app_dir) in result.missing_paths
     assert default_persistent_disk_path(app_dir) in result.missing_paths
 
 
@@ -31,10 +33,18 @@ def test_check_runtime_ok_when_assets_exist(monkeypatch, tmp_path: Path) -> None
     app_dir = tmp_path / "runtime"
     images_dir(app_dir).mkdir(parents=True)
     disks_dir(app_dir).mkdir(parents=True)
-    base_image_path(app_dir).touch()
+    kernel_image_path(app_dir).touch()
+    initramfs_image_path(app_dir).touch()
     default_persistent_disk_path(app_dir).touch()
     runtime_metadata_path(app_dir).write_text(
-        json.dumps({"schema": preflight.RUNTIME_SCHEMA_VERSION, "guest_arch": "x86_64"}) + "\n",
+        json.dumps(
+            {
+                "schema": preflight.RUNTIME_SCHEMA_VERSION,
+                "guest_arch": "x86_64",
+                "runtime_kind": "distroless-python-initramfs",
+            }
+        )
+        + "\n",
         encoding="utf-8",
     )
 
@@ -53,10 +63,18 @@ def test_check_runtime_rejects_old_metadata_schema(monkeypatch, tmp_path: Path) 
     app_dir = tmp_path / "runtime"
     images_dir(app_dir).mkdir(parents=True)
     disks_dir(app_dir).mkdir(parents=True)
-    base_image_path(app_dir).touch()
+    kernel_image_path(app_dir).touch()
+    initramfs_image_path(app_dir).touch()
     default_persistent_disk_path(app_dir).touch()
     runtime_metadata_path(app_dir).write_text(
-        json.dumps({"schema": 1, "guest_arch": "x86_64"}) + "\n",
+        json.dumps(
+            {
+                "schema": 1,
+                "guest_arch": "x86_64",
+                "runtime_kind": "distroless-python-initramfs",
+            }
+        )
+        + "\n",
         encoding="utf-8",
     )
 

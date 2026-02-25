@@ -52,6 +52,14 @@ def base_image_path(app_dir: str | Path | None = None) -> Path:
     return images_dir(app_dir) / "base.qcow2"
 
 
+def kernel_image_path(app_dir: str | Path | None = None) -> Path:
+    return images_dir(app_dir) / "kernel"
+
+
+def initramfs_image_path(app_dir: str | Path | None = None) -> Path:
+    return images_dir(app_dir) / "rootfs-initramfs.cpio.gz"
+
+
 def default_persistent_disk_path(app_dir: str | Path | None = None) -> Path:
     return disks_dir(app_dir) / "default.qcow2"
 

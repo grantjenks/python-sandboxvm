@@ -10,15 +10,16 @@ from pathlib import Path
 from typing import Any
 
 from .runtime_paths import (
-    base_image_path,
     default_persistent_disk_path,
     disks_dir,
     get_app_dir,
+    initramfs_image_path,
     images_dir,
+    kernel_image_path,
     runtime_metadata_path,
 )
 
-RUNTIME_SCHEMA_VERSION = 2
+RUNTIME_SCHEMA_VERSION = 3
 
 
 def qemu_system_candidates() -> tuple[str, ...]:
@@ -83,6 +84,14 @@ def _read_runtime_metadata(path: Path) -> tuple[dict[str, Any] | None, list[str]
     if guest_arch != "x86_64":
         errors.append(f"Runtime guest_arch must be 'x86_64', got: {guest_arch!r}.")
 
+    runtime_kind = raw.get("runtime_kind")
+    if runtime_kind != "distroless-python-initramfs":
+        errors.append(
+            "Runtime metadata runtime_kind must be "
+            "'distroless-python-initramfs', "
+            f"got: {runtime_kind!r}."
+        )
+
     return raw, errors
 
 
@@ -93,7 +102,8 @@ def check_runtime(app_dir: str | Path | None = None) -> RuntimeCheckResult:
     required_paths = [
         images_dir(resolved_app_dir),
         disks_dir(resolved_app_dir),
-        base_image_path(resolved_app_dir),
+        kernel_image_path(resolved_app_dir),
+        initramfs_image_path(resolved_app_dir),
         default_persistent_disk_path(resolved_app_dir),
         metadata_path,
     ]

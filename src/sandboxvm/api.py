@@ -3,19 +3,18 @@
 from __future__ import annotations
 
 import base64
-import io
 import re
 import subprocess
-import tempfile
-import textwrap
-import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
-import pycdlib
-
 from .preflight import assert_runtime_ready, check_runtime
-from .runtime_paths import base_image_path, default_persistent_disk_path, get_app_dir
+from .runtime_paths import (
+    default_persistent_disk_path,
+    get_app_dir,
+    initramfs_image_path,
+    kernel_image_path,
+)
 
 _MIN_MEMORY_MB = 100
 _MAX_MEMORY_MB = 4096
@@ -29,8 +28,8 @@ _STDERR_END = "__SANDBOXVM_STDERR_END__"
 _EXIT_CODE_PREFIX = "__SANDBOXVM_EXIT_CODE__"
 _TIMED_OUT_PREFIX = "__SANDBOXVM_TIMED_OUT__"
 
-_BOOT_TIMEOUT_S = 420.0
-_POST_COMMAND_GRACE_S = 30.0
+_BOOT_TIMEOUT_S = 120.0
+_POST_COMMAND_GRACE_S = 10.0
 
 
 @dataclass
@@ -108,51 +107,36 @@ class Sandbox:
         runtime = check_runtime(self.app_dir)
         if not runtime.ok:
             assert_runtime_ready(self.app_dir)
-        if runtime.qemu_img_binary is None or runtime.qemu_system_binary is None:
+        if runtime.qemu_system_binary is None:
             assert_runtime_ready(self.app_dir)
 
-        with tempfile.TemporaryDirectory(prefix="sandboxvm-run-") as temp_dir:
-            tmp = Path(temp_dir)
-            overlay_disk = tmp / "overlay.qcow2"
-            seed_iso = tmp / "seed.iso"
+        qemu_args = self._build_qemu_args(
+            qemu_system_binary=runtime.qemu_system_binary,
+            command=command,
+            timeout_s=timeout_s,
+        )
+        host_timeout_s = _BOOT_TIMEOUT_S + _POST_COMMAND_GRACE_S
+        if timeout_s is not None:
+            host_timeout_s += timeout_s
 
-            self._create_overlay_disk(
-                qemu_img_binary=runtime.qemu_img_binary,
-                overlay_disk=overlay_disk,
+        try:
+            completed = subprocess.run(
+                qemu_args,
+                capture_output=True,
+                check=False,
+                text=True,
+                timeout=host_timeout_s,
             )
-            self._create_cloud_init_iso(
-                seed_iso=seed_iso,
-                command=command,
-                timeout_s=timeout_s,
+        except subprocess.TimeoutExpired as exc:
+            return RunResult(
+                exit_code=124,
+                stdout="",
+                stderr=(
+                    "VM execution timed out before producing a result.\n"
+                    f"{_coerce_text(exc.stdout)}\n{_coerce_text(exc.stderr)}"
+                ),
+                timed_out=True,
             )
-
-            qemu_args = self._build_qemu_args(
-                qemu_system_binary=runtime.qemu_system_binary,
-                overlay_disk=overlay_disk,
-                seed_iso=seed_iso,
-            )
-            host_timeout_s = _BOOT_TIMEOUT_S + _POST_COMMAND_GRACE_S
-            if timeout_s is not None:
-                host_timeout_s += timeout_s
-
-            try:
-                completed = subprocess.run(
-                    qemu_args,
-                    capture_output=True,
-                    check=False,
-                    text=True,
-                    timeout=host_timeout_s,
-                )
-            except subprocess.TimeoutExpired as exc:
-                return RunResult(
-                    exit_code=124,
-                    stdout="",
-                    stderr=(
-                        "VM execution timed out before producing a result.\n"
-                        f"{_coerce_text(exc.stdout)}\n{_coerce_text(exc.stderr)}"
-                    ),
-                    timed_out=True,
-                )
 
         parsed = _parse_run_result(f"{completed.stdout}\n{completed.stderr}")
         if parsed is None:
@@ -161,50 +145,30 @@ class Sandbox:
                 stdout="",
                 stderr=(
                     "VM did not return structured execution markers.\n"
-                    "This usually indicates a boot or cloud-init failure.\n"
+                    "This usually indicates a boot or guest init failure.\n"
                     f"qemu return code: {completed.returncode}\n"
                     f"{completed.stdout}\n{completed.stderr}"
                 ),
             )
         return parsed
 
-    def _create_overlay_disk(self, *, qemu_img_binary: str, overlay_disk: Path) -> None:
-        subprocess.run(
-            [
-                qemu_img_binary,
-                "create",
-                "-f",
-                "qcow2",
-                "-F",
-                "qcow2",
-                "-b",
-                str(base_image_path(self.app_dir)),
-                str(overlay_disk),
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-
-    def _create_cloud_init_iso(
-        self,
-        *,
-        seed_iso: Path,
-        command: str,
-        timeout_s: float | None,
-    ) -> None:
-        run_script = _build_guest_run_script(command=command, timeout_s=timeout_s)
-        user_data = _build_user_data(run_script=run_script)
-        meta_data = _build_meta_data()
-        _write_cloud_init_iso(seed_iso=seed_iso, user_data=user_data, meta_data=meta_data)
-
     def _build_qemu_args(
         self,
         *,
         qemu_system_binary: str,
-        overlay_disk: Path,
-        seed_iso: Path,
+        command: str,
+        timeout_s: float | None,
     ) -> list[str]:
+        cmd_b64 = base64.urlsafe_b64encode(command.encode("utf-8")).decode("ascii")
+        append = [
+            "console=ttyS0",
+            "panic=1",
+            "quiet",
+            f"sandbox_cmd_b64={cmd_b64}",
+        ]
+        if timeout_s is not None:
+            append.append(f"sandbox_timeout={timeout_s:.6f}")
+
         args = [
             qemu_system_binary,
             "-machine",
@@ -222,116 +186,22 @@ class Sandbox:
             "-serial",
             "stdio",
             "-no-reboot",
-            "-drive",
-            f"if=virtio,format=qcow2,file={overlay_disk}",
+            "-kernel",
+            str(kernel_image_path(self.app_dir)),
+            "-initrd",
+            str(initramfs_image_path(self.app_dir)),
+            "-append",
+            " ".join(append),
             "-drive",
             f"if=virtio,format=qcow2,file={default_persistent_disk_path(self.app_dir)}",
-            "-drive",
-            f"if=ide,media=cdrom,readonly=on,format=raw,file={seed_iso}",
             "-device",
             "virtio-rng-pci",
         ]
         if self.config.network.enabled:
             args.extend(["-nic", "user,model=virtio-net-pci"])
         else:
-            # Keep an interface present so guest boot services don't stall on
-            # "wait-online", while using slirp's restricted mode.
-            args.extend(["-nic", "user,model=virtio-net-pci,restrict=on"])
+            args.extend(["-nic", "none"])
         return args
-
-
-def _build_guest_run_script(*, command: str, timeout_s: float | None) -> str:
-    command_b64 = base64.b64encode(command.encode("utf-8")).decode("ascii")
-    timeout_literal = "" if timeout_s is None else f"{timeout_s}s"
-    return textwrap.dedent(
-        f"""\
-        #!/bin/bash
-        set -u
-
-        stdout_file=/tmp/sandboxvm.stdout
-        stderr_file=/tmp/sandboxvm.stderr
-        timed_out=0
-        cmd="$(printf '%s' '{command_b64}' | base64 -d)"
-
-        if [ -n "{timeout_literal}" ] && command -v timeout >/dev/null 2>&1; then
-          timeout --signal=KILL --preserve-status {timeout_literal} bash -lc "$cmd" >"$stdout_file" 2>"$stderr_file"
-          exit_code=$?
-        else
-          bash -lc "$cmd" >"$stdout_file" 2>"$stderr_file"
-          exit_code=$?
-        fi
-
-        if [ "$exit_code" -eq 124 ]; then
-          timed_out=1
-        fi
-
-        printf "{_STDOUT_BEGIN}\\n"
-        base64 "$stdout_file" | tr -d '\\n'
-        printf "\\n{_STDOUT_END}\\n"
-
-        printf "{_STDERR_BEGIN}\\n"
-        base64 "$stderr_file" | tr -d '\\n'
-        printf "\\n{_STDERR_END}\\n"
-
-        printf "{_EXIT_CODE_PREFIX}%s\\n" "$exit_code"
-        printf "{_TIMED_OUT_PREFIX}%s\\n" "$timed_out"
-        sync
-        poweroff -f
-        """
-    )
-
-
-def _build_user_data(*, run_script: str) -> str:
-    script_b64 = base64.b64encode(run_script.encode("utf-8")).decode("ascii")
-    return textwrap.dedent(
-        f"""\
-        #cloud-config
-        ssh_deletekeys: false
-        ssh_genkeytypes: []
-        package_update: false
-        package_upgrade: false
-        write_files:
-          - path: /var/lib/sandboxvm/run.sh
-            permissions: "0755"
-            encoding: b64
-            content: {script_b64}
-        runcmd:
-          - [ bash, -lc, "/var/lib/sandboxvm/run.sh > /dev/ttyS0 2>&1" ]
-        """
-    )
-
-
-def _build_meta_data() -> str:
-    return textwrap.dedent(
-        f"""\
-        instance-id: sandboxvm-{uuid.uuid4()}
-        local-hostname: sandboxvm
-        """
-    )
-
-
-def _write_cloud_init_iso(*, seed_iso: Path, user_data: str, meta_data: str) -> None:
-    seed_iso.parent.mkdir(parents=True, exist_ok=True)
-    iso = pycdlib.PyCdlib()
-    user_data_bytes = user_data.encode("utf-8")
-    meta_data_bytes = meta_data.encode("utf-8")
-    try:
-        iso.new(interchange_level=3, joliet=3, rock_ridge="1.09", vol_ident="CIDATA")
-        iso.add_fp(
-            io.BytesIO(user_data_bytes),
-            len(user_data_bytes),
-            "/USERDATA.;1",
-            rr_name="user-data",
-        )
-        iso.add_fp(
-            io.BytesIO(meta_data_bytes),
-            len(meta_data_bytes),
-            "/METADATA.;1",
-            rr_name="meta-data",
-        )
-        iso.write(str(seed_iso))
-    finally:
-        iso.close()
 
 
 def _parse_run_result(raw_output: str) -> RunResult | None:

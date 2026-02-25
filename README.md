@@ -82,11 +82,11 @@ with Sandbox(cfg) as vm:
 
 ## Runtime Architecture
 
-### Disk Model
+### Runtime Assets
 
-- `base.qcow2`: read-only, stored in a runtime directory and managed separately from the Python wheel.
-- `overlay.qcow2`: per-run disposable layer on top of base.
-- `persist.qcow2`: user-scoped or run-scoped persistent disk, separate device.
+- `images/kernel`: Linux kernel used for guest boot (`qemu -kernel`).
+- `images/rootfs-initramfs.cpio.gz`: distroless Python root filesystem plus guest init.
+- `disks/default.qcow2`: persistent disk reserved for future stateful workflows.
 
 ### Boot + Execution Model
 
@@ -197,7 +197,8 @@ This command:
 
 - selects a platform-appropriate `sandboxvm` app directory,
 - creates `images/` and `disks/` folders,
-- creates `images/base.qcow2`,
+- pulls a distroless Python image and assembles `images/rootfs-initramfs.cpio.gz`,
+- pulls a Linux kernel image and writes `images/kernel`,
 - creates `disks/default.qcow2`,
 - writes runtime metadata (`runtime.json`).
 
